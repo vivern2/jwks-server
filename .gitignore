@@ -7,3 +7,6 @@ venv/
 .venv/
 server.log
 *.egg-info/
+gradebot
+CSCE3550_Linux_x86_64.tar.gz
+LICENSE
