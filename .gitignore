@@ -10,3 +10,8 @@ server.log
 gradebot
 CSCE3550_Linux_x86_64.tar.gz
 LICENSE
+# Generated SQLite databases containing private keys
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

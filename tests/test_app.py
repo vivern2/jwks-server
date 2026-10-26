@@ -1,185 +1,256 @@
-"""
-test_app.py
+"""Tests for SQLite storage, JWT issuance, and public JWKS responses."""
 
-Pytest test suite for the JWKS server (app.py + key_manager.py).
-
-Run with:
-    pytest --cov=. --cov-report=term-missing
-
-Covers:
-    - JWKS endpoint returns only unexpired keys, in valid JWK format.
-    - /auth issues a valid JWT signed with the active key, verifiable
-      using the public key served by JWKS.
-    - /auth?expired=... issues a JWT signed with the expired key, whose
-      `kid` is NOT present in the JWKS response, and whose `exp` claim
-      is in the past.
-    - Disallowed HTTP methods return 405.
-    - key_manager helper functions behave correctly (kid uniqueness,
-      expiry detection, JWK field correctness).
-"""
-
+import sqlite3
 import time
+from contextlib import closing
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 
-from app import app as flask_app
-from key_manager import KeyStore, generate_rsa_key
+from app import create_app
+from key_manager import KeyStore
 
 
 @pytest.fixture
-def client():
-    flask_app.config["TESTING"] = True
-    with flask_app.test_client() as test_client:
-        yield test_client
+def application(tmp_path):
+    app = create_app(tmp_path / "test.db")
+    app.config["TESTING"] = True
+    return app
 
 
-# ---------------------------------------------------------------------------
-# JWKS endpoint tests
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def client(application):
+    return application.test_client()
 
 
-def test_jwks_returns_200_and_json(client):
+@pytest.fixture
+def store(application):
+    return application.extensions["key_store"]
+
+
+def test_database_schema(store):
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        columns = connection.execute("PRAGMA table_info(keys)").fetchall()
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ?",
+            ("keys",),
+        ).fetchone()[0]
+
+    assert [(column[1], column[2]) for column in columns] == [
+        ("kid", "INTEGER"),
+        ("key", "BLOB"),
+        ("exp", "INTEGER"),
+    ]
+    assert columns[0][5] == 1
+    assert columns[1][3] == 1
+    assert columns[2][3] == 1
+    assert "AUTOINCREMENT" in schema.upper()
+
+
+def test_database_contains_expired_and_future_keys(store):
+    now = int(time.time())
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        rows = connection.execute("SELECT key, exp FROM keys").fetchall()
+
+    assert any(expiry <= now for _, expiry in rows)
+    assert any(expiry >= now + 3600 for _, expiry in rows)
+
+    for pem, _ in rows:
+        assert isinstance(pem, bytes)
+        assert pem.startswith(b"-----BEGIN RSA PRIVATE KEY-----")
+        private_key = serialization.load_pem_private_key(
+            pem,
+            password=None,
+        )
+        assert private_key.key_size == 2048
+
+
+def test_keys_persist_after_reopening(store):
+    original = store.get_signing_key()
+    reopened = KeyStore(store.db_path)
+    restored = reopened.get_signing_key()
+
+    assert restored.kid == original.kid
+    assert (
+        restored.private_key.private_numbers()
+        == original.private_key.private_numbers()
+    )
+
+
+def test_initialization_does_not_duplicate_keys(store):
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) FROM keys"
+        ).fetchone()[0]
+
+    store.ensure_keys()
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        after = connection.execute(
+            "SELECT COUNT(*) FROM keys"
+        ).fetchone()[0]
+
+    assert after == before
+
+
+def test_key_expiration_and_unique_ids(store):
+    active = store.get_signing_key()
+    expired = store.get_signing_key(expired=True)
+
+    assert active.kid != expired.kid
+    assert not active.is_expired()
+    assert expired.is_expired()
+    assert active.is_expired(now=active.expiry)
+
+
+def test_jwks_returns_public_keys_only(client, store):
     response = client.get("/.well-known/jwks.json")
+
     assert response.status_code == 200
     assert response.is_json
 
+    keys = response.get_json()["keys"]
+    kids = [key["kid"] for key in keys]
 
-def test_jwks_contains_only_unexpired_keys(client):
-    response = client.get("/.well-known/jwks.json")
-    data = response.get_json()
-    assert "keys" in data
-    kids = [key["kid"] for key in data["keys"]]
+    assert store.get_signing_key().kid in kids
+    assert store.get_signing_key(expired=True).kid not in kids
 
-    from app import key_store
-
-    assert key_store.active_key.kid in kids
-    assert key_store.expired_key.kid not in kids
-
-
-def test_jwks_key_fields(client):
-    response = client.get("/.well-known/jwks.json")
-    data = response.get_json()
-    assert len(data["keys"]) >= 1
-    for jwk in data["keys"]:
-        assert jwk["kty"] == "RSA"
-        assert jwk["use"] == "sig"
-        assert jwk["alg"] == "RS256"
-        assert "kid" in jwk
-        assert "n" in jwk
-        assert "e" in jwk
+    for key in keys:
+        assert set(key) == {"kty", "use", "alg", "kid", "n", "e"}
+        assert key["kty"] == "RSA"
+        assert key["use"] == "sig"
+        assert key["alg"] == "RS256"
 
 
-def test_jwks_rejects_post(client):
-    response = client.post("/.well-known/jwks.json")
-    assert response.status_code == 405
+def test_jwks_reads_all_valid_database_keys(client, store):
+    additional = store.save_key(int(time.time()) + 10000)
+    keys = client.get("/.well-known/jwks.json").get_json()["keys"]
+
+    assert len(keys) == 2
+    assert additional.kid in {key["kid"] for key in keys}
 
 
-# ---------------------------------------------------------------------------
-# /auth endpoint tests
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("credentials", ["none", "basic", "json"])
+def test_auth_signature_verified_with_published_jwk(client, credentials):
+    options = {}
 
+    if credentials == "basic":
+        options["headers"] = {
+            "Authorization": "Basic dXNlckFCQzpwYXNzd29yZDEyMw=="
+        }
+    elif credentials == "json":
+        options["json"] = {
+            "username": "userABC",
+            "password": "password123",
+        }
 
-def test_auth_returns_200(client):
-    response = client.post("/auth")
+    response = client.post("/auth", **options)
+
     assert response.status_code == 200
 
-
-def test_auth_returns_valid_jwt_signed_with_active_key(client):
-    from app import key_store
-
-    response = client.post("/auth")
     token = response.get_data(as_text=True)
-
     header = jwt.get_unverified_header(token)
-    assert header["kid"] == key_store.active_key.kid
+    keys = client.get("/.well-known/jwks.json").get_json()["keys"]
+    matching = next(key for key in keys if key["kid"] == header["kid"])
+    public_key = jwt.PyJWK.from_dict(matching).key
+    payload = jwt.decode(token, public_key, algorithms=["RS256"])
 
-    public_key = key_store.active_key.public_key
-    decoded = jwt.decode(token, key=public_key, algorithms=["RS256"])
-    assert decoded["sub"] == "fake-user"
-    assert decoded["exp"] > time.time()
-
-
-def test_auth_get_not_allowed(client):
-    response = client.get("/auth")
-    assert response.status_code == 405
+    assert header["alg"] == "RS256"
+    assert payload["sub"] == "userABC"
+    assert payload["exp"] > time.time()
 
 
-def test_auth_expired_query_param_uses_expired_key(client):
-    from app import key_store
+@pytest.mark.parametrize(
+    "query",
+    ["?expired", "?expired=true", "?expired=false"],
+)
+def test_expired_parameter_presence(client, store, query):
+    response = client.post("/auth" + query)
 
-    response = client.post("/auth?expired=true")
     assert response.status_code == 200
+
     token = response.get_data(as_text=True)
+    expired = store.get_signing_key(expired=True)
 
-    header = jwt.get_unverified_header(token)
-    assert header["kid"] == key_store.expired_key.kid
+    assert jwt.get_unverified_header(token)["kid"] == expired.kid
 
-    public_key = key_store.expired_key.public_key
     with pytest.raises(jwt.ExpiredSignatureError):
-        jwt.decode(token, key=public_key, algorithms=["RS256"])
+        jwt.decode(token, expired.public_key, algorithms=["RS256"])
 
-    decoded = jwt.decode(
-        token, key=public_key, algorithms=["RS256"], options={"verify_exp": False}
+    payload = jwt.decode(
+        token,
+        expired.public_key,
+        algorithms=["RS256"],
+        options={"verify_exp": False},
     )
-    assert decoded["exp"] < time.time()
+
+    assert payload["exp"] == expired.expiry
+    assert payload["exp"] <= time.time()
 
 
-def test_auth_expired_flag_present_without_value(client):
-    """The 'expired' param should trigger expired behavior even with no value."""
-    from app import key_store
+@pytest.mark.parametrize(
+    "path, method",
+    [
+        ("/auth", "GET"),
+        ("/auth", "PUT"),
+        ("/auth", "DELETE"),
+        ("/.well-known/jwks.json", "POST"),
+    ],
+)
+def test_unsupported_methods(client, path, method):
+    response = client.open(path, method=method)
 
-    response = client.post("/auth?expired")
-    token = response.get_data(as_text=True)
-    header = jwt.get_unverified_header(token)
-    assert header["kid"] == key_store.expired_key.kid
-
-
-# ---------------------------------------------------------------------------
-# key_manager unit tests
-# ---------------------------------------------------------------------------
-
-
-def test_generate_rsa_key_future_expiry_not_expired():
-    key = generate_rsa_key(expiry_offset_seconds=3600)
-    assert not key.is_expired()
+    assert response.status_code == 405
+    assert response.get_json() == {"error": "method not allowed"}
 
 
-def test_generate_rsa_key_past_expiry_is_expired():
-    key = generate_rsa_key(expiry_offset_seconds=-3600)
-    assert key.is_expired()
+def test_expiration_boundary_excluded_from_jwks(store, monkeypatch):
+    boundary = 2000000000
+    monkeypatch.setattr("key_manager.time.time", lambda: boundary)
+    key = store.save_key(boundary)
+
+    assert key.kid not in {
+        item["kid"] for item in store.get_valid_jwks()
+    }
+    assert store.get_signing_key(expired=True).kid == key.kid
 
 
-def test_generate_rsa_key_unique_kids():
-    key_a = generate_rsa_key(expiry_offset_seconds=3600)
-    key_b = generate_rsa_key(expiry_offset_seconds=3600)
-    assert key_a.kid != key_b.kid
+@pytest.mark.parametrize("expired", [False, True])
+def test_missing_key_raises_lookup_error(store, expired):
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        with connection:
+            connection.execute("DELETE FROM keys")
+
+    with pytest.raises(LookupError):
+        store.get_signing_key(expired=expired)
 
 
-def test_key_store_get_signing_key():
-    store = KeyStore()
-    assert store.get_signing_key(expired=False) is store.active_key
-    assert store.get_signing_key(expired=True) is store.expired_key
+def test_auth_recovers_when_no_keys_remain(client, store):
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        with connection:
+            connection.execute("DELETE FROM keys")
+
+    assert client.post("/auth").status_code == 200
+    assert len(
+        client.get("/.well-known/jwks.json").get_json()["keys"]
+    ) == 1
 
 
-def test_key_store_valid_jwks_excludes_expired():
-    store = KeyStore()
-    jwks_list = store.get_valid_jwks()
-    kids = [k["kid"] for k in jwks_list]
-    assert store.active_key.kid in kids
-    assert store.expired_key.kid not in kids
+def test_parameterized_insert_does_not_execute_sql(store):
+    value = "0); DROP TABLE keys; --"
+    key = store.save_key(value)
 
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        stored = connection.execute(
+            "SELECT exp FROM keys WHERE kid = ?",
+            (int(key.kid),),
+        ).fetchone()[0]
 
-def test_to_jwk_matches_public_numbers():
-    key = generate_rsa_key(expiry_offset_seconds=3600)
-    jwk = key.to_jwk()
-    numbers = key.public_key.public_numbers()
+        count = connection.execute(
+            "SELECT COUNT(*) FROM keys"
+        ).fetchone()[0]
 
-    import base64
-
-    def b64url_decode_to_int(s):
-        padding = "=" * (-len(s) % 4)
-        return int.from_bytes(base64.urlsafe_b64decode(s + padding), "big")
-
-    assert b64url_decode_to_int(jwk["n"]) == numbers.n
-    assert b64url_decode_to_int(jwk["e"]) == numbers.e
+    assert stored == value
+    assert count >= 3
