@@ -1,92 +1,135 @@
-# JWKS Server
+# Project 2: SQLite-Backed JWKS Server
 
-A minimal RESTful JWKS (JSON Web Key Set) server, built with **Python** and
-**Flask**, for the "Implementing a basic JWKS Server" assignment.
+**Author:** Moshood Abisoye  
+**Course:** CSCE 3550
 
-## What it does
+A Flask JWKS server that persists RSA private keys in SQLite and issues
+RS256-signed JWTs for a mock user.
 
-- Generates two RSA key pairs on startup:
-  - An **active** key (expires 1 hour from now).
-  - An **expired** key (expired 1 hour ago).
-- Each key has a unique `kid` (Key ID).
-- `GET /.well-known/jwks.json` — returns a JWKS document containing only
-  the **unexpired** public key(s), in standard JWK format.
-- `POST /auth` — issues a signed JWT for a mock user.
-  - Normally signs with the active key and a future `exp`.
-  - If a query parameter named `expired` is present
-    (e.g. `POST /auth?expired=true`), signs with the expired key and an
-    already-past `exp`, so you can exercise expired-key handling.
-- Runs on port **8080**.
+## Features
 
-## Project layout
-jwks-server/
-├── app.py # Flask app: routes / HTTP layer
-├── key_manager.py # RSA key generation, kid, expiry, JWK encoding
-├── requirements.txt
-├── setup.cfg # flake8 config
-├── tests/
-│ └── test_app.py # pytest test suite (99% coverage)
-└── README.md
+- Runs on port 8080.
+- Stores private keys in `totally_not_my_privateKeys.db`.
+- Serializes RSA private keys as PKCS1 PEM bytes.
+- Uses parameterized SQL queries.
+- Preserves keys across server restarts.
+- Ensures an expired key and a key valid for at least one hour exist.
+- Publishes only unexpired public keys.
+- Uses database key identifiers as JWT and JWK `kid` values.
 
+## Database schema
 
-## Setup (WSL / Ubuntu / Linux)
+```sql
+CREATE TABLE IF NOT EXISTS keys(
+    kid INTEGER PRIMARY KEY AUTOINCREMENT,
+    key BLOB NOT NULL,
+    exp INTEGER NOT NULL
+)
+```
+
+The database is created in the working directory when the server starts.
+Generated databases are excluded from Git because they contain private keys.
+
+## Setup
 
 ```bash
-cd ~/Projects/School/SeniorCybersecurity/jwks-server
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Running the server
+SQLite support is included with Python.
+
+## Run
+
+From the repository root:
 
 ```bash
 python app.py
 ```
 
-Listens on `http://0.0.0.0:8080`.
+The server listens on port 8080.
 
-## Trying it manually
+## Endpoints
+
+### GET /.well-known/jwks.json
+
+Queries all unexpired database keys and returns their public RSA components
+in a JWKS document. Private key material is never included.
+
+### POST /auth
+
+Queries an unexpired private key and returns a signed JWT for `userABC`.
+
+If the `expired` query parameter is present, regardless of its value,
+the server uses an expired database key and an expired JWT expiration claim.
+
+Authentication is mocked. Requests with no credentials, HTTP Basic
+credentials, or JSON credentials are accepted without credential validation.
+
+Examples:
 
 ```bash
 curl -X POST http://localhost:8080/auth
-curl -X POST "http://localhost:8080/auth?expired=true"
+curl -X POST "http://localhost:8080/auth?expired"
+curl -X POST -u userABC:password123 http://localhost:8080/auth
 curl http://localhost:8080/.well-known/jwks.json
 ```
 
-## Running the test suite / coverage
+Unsupported methods such as GET /auth return HTTP 405.
+
+## Tests and coverage
 
 ```bash
-python -m pytest --cov=. --cov-report=term-missing
+python -m pytest --cov=app --cov=key_manager --cov-branch --cov-report=term-missing --cov-fail-under=81
 ```
 
-Currently reports **99% coverage** (target: >80%).
+Verified results: **22 tests passed, with 100% statement and branch coverage**
+for `app.py` and `key_manager.py`.
+
+Tests cover database schema, PEM storage, persistence, parameterized
+inserts, expiration boundaries, JWT signature verification, mock
+credential formats, and unsupported HTTP methods.
 
 ## Linting
 
 ```bash
-flake8 .
+python -m flake8 app.py key_manager.py tests/test_app.py
 ```
 
-## Running the official (blackbox) test client
+## Gradebot
 
-Test client releases: https://github.com/jh125486/CSCE3550/releases
+Stop any manually running server before executing Gradebot.
+Run from the repository root:
 
-1. With `app.py` running, download the correct Linux asset for your
-   architecture (`uname -m`), `chmod +x` it, and run it per the release
-   instructions against `localhost:8080`.
-2. Screenshot the output (with identifying info visible).
+```bash
+./gradebot project-2 --dir="." --run="./venv/bin/python app.py"
+```
 
-## Deliverables checklist
+Verified Gradebot result: **98.93%**, with full points for all functional
+checks and 4.25/5 for quality.
 
-- [ ] Push this repo to your own GitHub account.
-- [ ] Screenshot of the test client running successfully.
-- [ ] Screenshot of `pytest --cov` output showing >80% coverage.
-- [ ] Both screenshots show identifying information.
+## Screenshots
 
-## Notes
+### Gradebot rubric
 
-- Keys are generated in memory at process startup — no database needed.
-- `/auth` does not perform real credential checking, per the assignment.
-- Only unexpired keys are ever returned from the JWKS endpoint.
-- Educational project only — not a production authentication system.
+![Gradebot results with identification](screenshots/gradebot-project2-with-name.png)
+
+### Test coverage
+
+![Test coverage with identification](screenshots/coverage-project2-with-name.png)
+
+## Project structure
+
+- `app.py`: Flask application factory and HTTP endpoints.
+- `key_manager.py`: RSA generation, SQLite storage, and JWK serialization.
+- `tests/test_app.py`: automated tests using temporary databases.
+- `requirements.txt`: Python dependencies.
+- `setup.cfg`: lint configuration.
+- `screenshots/`: identified Gradebot and coverage screenshots.
+
+## Limitations
+
+This is an educational implementation. It mocks authentication and stores
+unencrypted private keys in a local database. It is not a production
+authentication service.
